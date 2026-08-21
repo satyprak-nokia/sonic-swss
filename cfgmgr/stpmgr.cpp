@@ -274,8 +274,27 @@ void StpMgr::doStpVlanTask(Consumer &consumer)
         string key = kfvKey(t);
         string op  = kfvOp(t);
 
-        string vlanKey = key.substr(4); // Remove Vlan prefix
-        int vlan_id = stoi(vlanKey.c_str());
+        if (key.size() <= strlen(VLAN_PREFIX) ||
+            key.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX) != 0)
+        {
+            SWSS_LOG_ERROR("Invalid STP_VLAN key format %s", key.c_str());
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+
+        string vlanKey = key.substr(strlen(VLAN_PREFIX));
+        int vlan_id = 0;
+        try
+        {
+            vlan_id = stoi(vlanKey);
+        }
+        catch (const std::exception &e)
+        {
+            SWSS_LOG_ERROR("Invalid vlan ID in STP_VLAN key '%s': %s",
+                           key.c_str(), e.what());
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
 
         SWSS_LOG_INFO("STP vlan key %s op %s", key.c_str(), op.c_str());
         if (op == SET_COMMAND)
@@ -287,30 +306,40 @@ void StpMgr::doStpVlanTask(Consumer &consumer)
                 continue;
             }
 
-            for (auto i : kfvFieldsValues(t))
+            try
             {
-                SWSS_LOG_DEBUG("Field: %s Val: %s", fvField(i).c_str(), fvValue(i).c_str());
+                for (auto i : kfvFieldsValues(t))
+                {
+                    SWSS_LOG_DEBUG("Field: %s Val: %s", fvField(i).c_str(), fvValue(i).c_str());
 
-                if (fvField(i) == "enabled")
-                {
-                    stpEnable = (fvValue(i) == "true") ? true : false;
+                    if (fvField(i) == "enabled")
+                    {
+                        stpEnable = (fvValue(i) == "true") ? true : false;
+                    }
+                    else if (fvField(i) == "forward_delay")
+                    {
+                        forwardDelay = stoi(fvValue(i).c_str());
+                    }
+                    else if (fvField(i) == "hello_time")
+                    {
+                        helloTime = stoi(fvValue(i).c_str());
+                    }
+                    else if (fvField(i) == "max_age")
+                    {
+                        maxAge = stoi(fvValue(i).c_str());
+                    }
+                    else if (fvField(i) == "priority")
+                    {
+                        priority = stoi(fvValue(i).c_str());
+                    }
                 }
-                else if (fvField(i) == "forward_delay")
-                {
-                    forwardDelay = stoi(fvValue(i).c_str());
-                }
-                else if (fvField(i) == "hello_time")
-                {
-                    helloTime = stoi(fvValue(i).c_str());
-                }
-                else if (fvField(i) == "max_age")
-                {
-                    maxAge = stoi(fvValue(i).c_str());
-                }
-                else if (fvField(i) == "priority")
-                {
-                    priority = stoi(fvValue(i).c_str());
-                }
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_ERROR("Invalid STP_VLAN field in key '%s': %s",
+                               key.c_str(), e.what());
+                it = consumer.m_toSync.erase(it);
+                continue;
             }
         }
         else if (op == DEL_COMMAND)
@@ -1315,19 +1344,41 @@ void StpMgr::doStpMstInstPortTask(Consumer &consumer)
         string key = kfvKey(t);
         string op = kfvOp(t);
 
-        string mstKey = key.substr(13);//Remove MST_INSTANCE keyword
+        /* CLI: MST_INSTANCE|<mst_id>|<ifname>; YANG/CVL: <mst_id>|<ifname> */
+        constexpr size_t mstInstancePrefixLen = 13; // strlen("MST_INSTANCE|")
+        string mstKey;
+        if (key.size() > mstInstancePrefixLen &&
+            key.compare(0, mstInstancePrefixLen, "MST_INSTANCE|") == 0)
+        {
+            mstKey = key.substr(mstInstancePrefixLen);
+        }
+        else
+        {
+            mstKey = key;
+        }
+
         size_t found = mstKey.find(CONFIGDB_KEY_SEPARATOR);
 
         uint16_t mst_id;
         string intfName;
-        if (found != string::npos)
+        if (found != string::npos && found > 0 && (found + 1) < mstKey.size())
         {
-            mst_id = static_cast<uint16_t>(stoi(mstKey.substr(0, found)));
+            try
+            {
+                mst_id = static_cast<uint16_t>(stoi(mstKey.substr(0, found)));
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_ERROR("Invalid MST instance ID in key '%s': %s",
+                               key.c_str(), e.what());
+                it = consumer.m_toSync.erase(it);
+                continue;
+            }
             intfName = mstKey.substr(found + 1);
         }
         else
         {
-            SWSS_LOG_ERROR("Invalid key format %s", kfvKey(t).c_str());
+            SWSS_LOG_ERROR("Invalid key format %s", key.c_str());
             it = consumer.m_toSync.erase(it);
             continue;
         }
