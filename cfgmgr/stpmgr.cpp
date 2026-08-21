@@ -322,7 +322,15 @@ void StpMgr::doStpVlanTask(Consumer &consumer)
         string key = kfvKey(t);
         string op  = kfvOp(t);
 
-        string vlanKey = key.substr(4); // Remove Vlan prefix
+        if (key.size() <= strlen(VLAN_PREFIX) ||
+            key.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX) != 0)
+        {
+            SWSS_LOG_ERROR("Invalid STP_VLAN key format %s", key.c_str());
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+
+        string vlanKey = key.substr(strlen(VLAN_PREFIX));
         int vlan_id;
         if (!parseInteger(vlanKey, vlan_id, "STP_VLAN key"))
         {
@@ -366,6 +374,7 @@ void StpMgr::doStpVlanTask(Consumer &consumer)
                 {
                     configValid = parseInteger(fvValue(i), priority, "priority");
                 }
+
                 if (!configValid)
                 {
                     SWSS_LOG_ERROR("Invalid STP VLAN configuration for %s, ignoring", key.c_str());
@@ -1509,17 +1518,24 @@ void StpMgr::doStpMstInstPortTask(Consumer &consumer)
         string key = kfvKey(t);
         string op = kfvOp(t);
 
-        string mstKey = key;
-        const string mstInstancePrefix = "MST_INSTANCE|";
-        if (key.compare(0, mstInstancePrefix.size(), mstInstancePrefix) == 0)
+        /* CLI: MST_INSTANCE|<mst_id>|<ifname>; YANG/CVL: <mst_id>|<ifname> */
+        constexpr size_t mstInstancePrefixLen = 13; // strlen("MST_INSTANCE|")
+        string mstKey;
+        if (key.size() > mstInstancePrefixLen &&
+            key.compare(0, mstInstancePrefixLen, "MST_INSTANCE|") == 0)
         {
-            mstKey = key.substr(mstInstancePrefix.size());
+            mstKey = key.substr(mstInstancePrefixLen);
         }
+        else
+        {
+            mstKey = key;
+        }
+
         size_t found = mstKey.find(CONFIGDB_KEY_SEPARATOR);
 
         uint16_t mst_id;
         string intfName;
-        if (found != string::npos)
+        if (found != string::npos && found > 0 && (found + 1) < mstKey.size())
         {
             int parsedMstId;
             if (!parseInteger(mstKey.substr(0, found), parsedMstId, "MST instance port key"))
@@ -1533,7 +1549,7 @@ void StpMgr::doStpMstInstPortTask(Consumer &consumer)
         }
         else
         {
-            SWSS_LOG_ERROR("Invalid key format %s", kfvKey(t).c_str());
+            SWSS_LOG_ERROR("Invalid key format %s", key.c_str());
             it = consumer.m_toSync.erase(it);
             continue;
         }
