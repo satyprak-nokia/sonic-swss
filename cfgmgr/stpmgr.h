@@ -315,8 +315,12 @@ private:
                     std::vector<FieldValueTuple>&tupEntry);
     void processStpMstInstPortAttr(const std::string op, uint16_t mst_id, const std::string intfName,
                                        std::vector<FieldValueTuple>&tupEntry);
+    void processStpMstInstVlanPortList(const std::vector<uint16_t>& vlan_ids, bool add);
     std::vector<uint16_t> parseVlanList(const std::string &vlanStr);
+    std::vector<uint16_t> getVlanIdsForInstance(uint16_t instance) const;
     void updateVlanInstanceMap(int instance, const std::vector<uint16_t>&newVlanList, bool operation);
+    void ensureStpConfigDbOnVlanMemberAdd(uint16_t vlan_id, const std::string &intfName);
+    void cleanupStpConfigDbOnVlanMemberDelete(uint16_t vlan_id, const std::string &intfName);
     bool isInstanceMapped(uint16_t instance);
     std::vector<std::string> getVlanAliasesForInstance(uint16_t instance);
     
