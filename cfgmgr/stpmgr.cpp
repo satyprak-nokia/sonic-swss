@@ -1313,7 +1313,9 @@ void StpMgr::ensureStpConfigDbOnVlanMemberAdd(uint16_t vlan_id, const std::strin
             {"bpdu_guard", "false"},
             {"bpdu_guard_do_disable", "false"},
             {"root_guard", "false"},
-            {"priority", "128"}
+            {"priority", "128"},
+            {"edge_port", "false"},
+            {"link_type", "auto"}
         };
         m_cfgStpPortTable.set(intfName, defaults);
         SWSS_LOG_INFO("Created STP_PORT key %s with defaults", intfName.c_str());
