@@ -119,6 +119,7 @@ void StpMgr::doStpGlobalTask(Consumer &consumer)
         memset(&msg, 0, sizeof(STP_BRIDGE_CONFIG_MSG));
 
         enum L2_PROTO_MODE old_l2ProtoEnabled = l2ProtoEnabled;
+        bool replayMstVlanMembers = false;
 
         KeyOpFieldsValuesTuple t = it->second;
 
@@ -192,77 +193,9 @@ void StpMgr::doStpGlobalTask(Consumer &consumer)
 
             memcpy(msg.base_mac_addr, macAddress.getMac(), 6);
 
-            /* Send once when PVST/MSTP is enabled first time */
-            if ((l2ProtoEnabled == L2_MSTP) && (old_l2ProtoEnabled == L2_NONE))
-            {
-                SWSS_LOG_INFO("Populating VLANs for STP mode change: %d -> %d", old_l2ProtoEnabled, l2ProtoEnabled);
-
-                // Get all existing VLANs from state table instead of iterating 1-4095
-                vector<string> vlanKeys;
-                m_stateVlanTable.getKeys(vlanKeys);
-
-                SWSS_LOG_INFO("Found %zu configured VLANs to populate", vlanKeys.size());
-
-                for (auto vlanKey : vlanKeys)
-                {
-                    STP_MST_VLAN_PORT_MAP *vlan_msg = NULL;
-                    vector<PORT_ATTR> port_list;
-                    uint16_t portCnt = 0;
-                    int len, i = 0;
-
-                    // Extract VLAN ID from key (e.g., "Vlan100" -> 100)
-                    string vlanIdStr = vlanKey.substr(4); // Remove Vlan prefix
-
-                    int vlan_id;
-                    try
-                    {
-                        vlan_id = stoi(vlanIdStr);
-                    }
-                    catch (const std::exception& e)
-                    {
-                        SWSS_LOG_ERROR("Invalid VLAN ID in key '%s': %s", vlanKey.c_str(), e.what());
-                        continue;
-                    }
-
-
-                    // Get all port members for this VLAN
-                    portCnt = (uint16_t)getAllVlanMem(vlanKey, port_list);
-                    if (!portCnt)
-                        continue;
-
-                    SWSS_LOG_DEBUG("VLAN %d has %d ports", vlan_id, portCnt);
-                    len = (int)(sizeof(STP_MST_VLAN_PORT_MAP) + (portCnt * sizeof(PORT_LIST)));
-
-                    vlan_msg = (STP_MST_VLAN_PORT_MAP *)calloc(1, len);
-                    if (!vlan_msg)
-                    {
-                        SWSS_LOG_ERROR("calloc failed for vlan %d", vlan_id);
-                        // Continue processing other VLANs instead of returning
-                        continue;
-                    }
-
-                    // Populate port list
-                    PORT_LIST *attr = vlan_msg->port_list;
-                    for (auto p = port_list.begin(); p != port_list.end(); p++)
-                    {
-                        strncpy(attr[i].intf_name, p->intf_name, IFNAMSIZ);
-                        attr[i].tagging_mode = p->mode;
-                        SWSS_LOG_DEBUG("  Port[%u]: %s Mode %d", i, p->intf_name, p->mode);
-                        i++;
-                    }
-
-                    // Fill in VLAN message
-                    vlan_msg->port_count = portCnt;
-                    vlan_msg->vlan_id = (uint16_t)vlan_id;
-                    vlan_msg->stp_mode = l2ProtoEnabled;
-                    vlan_msg->add = true;
-
-                    // Send message to STP daemon
-                    sendMsgStpd(STP_MST_VLAN_PORT_LIST_CONFIG, len, (void *)vlan_msg, (L2_PROTO_MODE)vlan_msg->stp_mode);
-
-                    free(vlan_msg);
-                }
-            }
+            /* Replay STATE VLAN members after STP_BRIDGE_CONFIG so stpd
+             * adds them to CIST. Do not send while MST is still disabled. */
+            replayMstVlanMembers = (l2ProtoEnabled == L2_MSTP && old_l2ProtoEnabled == L2_NONE);
         }
         else if (op == DEL_COMMAND)
         {
@@ -290,6 +223,35 @@ void StpMgr::doStpGlobalTask(Consumer &consumer)
 
         // Send the message to the daemon
         sendMsgStpd(STP_BRIDGE_CONFIG, sizeof(msg), (void *)&msg, (L2_PROTO_MODE)msg.stp_mode);
+
+        if (replayMstVlanMembers)
+        {
+            vector<string> vlanKeys;
+            vector<uint16_t> vlan_ids;
+
+            m_stateVlanTable.getKeys(vlanKeys);
+            SWSS_LOG_INFO("Populating VLANs after MST enable, found %zu VLANs", vlanKeys.size());
+
+            for (const auto &vlanKey : vlanKeys)
+            {
+                try
+                {
+                    vlan_ids.push_back(static_cast<uint16_t>(stoi(vlanKey.substr(4))));
+                }
+                catch (const std::exception &e)
+                {
+                    SWSS_LOG_ERROR("Invalid VLAN ID in key '%s': %s", vlanKey.c_str(), e.what());
+                }
+            }
+
+            /* stpd receives STP_BRIDGE_CONFIG first (AF_UNIX DGRAM is ordered).
+             * processStpMstInstVlanPortList() then sends STP_MST_VLAN_PORT_LIST_CONFIG
+             * with MST already enabled so ports are added to the instance.
+             * VLAN members added with STP off are not queued; they are replayed
+             * here from STATE. Live member add after MST is on still uses
+             * doVlanMemUpdateTask(). */
+            processStpMstInstVlanPortList(vlan_ids, true);
+        }
 
         // Move to the next item
         it = consumer.m_toSync.erase(it);
