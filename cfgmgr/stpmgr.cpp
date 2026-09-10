@@ -27,6 +27,7 @@ StpMgr::StpMgr(DBConnector *confDb, DBConnector *applDb, DBConnector *statDb,
     m_cfgStpVlanPortTable(confDb, CFG_STP_VLAN_PORT_TABLE_NAME),
     m_cfgStpPortTable(confDb, CFG_STP_PORT_TABLE_NAME),
     m_cfgLagMemberTable(confDb, CFG_LAG_MEMBER_TABLE_NAME),
+    m_cfgVlanTable(confDb, CFG_VLAN_TABLE_NAME),
     m_cfgVlanMemberTable(confDb, CFG_VLAN_MEMBER_TABLE_NAME),
     m_stateVlanTable(statDb, STATE_VLAN_TABLE_NAME),
     m_stateLagTable(statDb, STATE_LAG_TABLE_NAME),
@@ -40,6 +41,7 @@ StpMgr::StpMgr(DBConnector *confDb, DBConnector *applDb, DBConnector *statDb,
     l2ProtoEnabled = L2_NONE;
 
     stpGlobalTask = stpVlanTask = stpVlanPortTask = stpPortTask = stpMstInstTask = false;
+    m_mstVlanReplayPending = false;
 
     // Initialize all VLANs to Invalid instance
     fill_n(m_vlanInstMap, MAX_VLANS, INVALID_INSTANCE);
@@ -170,6 +172,7 @@ void StpMgr::doStpGlobalTask(Consumer &consumer)
                     SWSS_LOG_ERROR("ebtables del failed for PVST %d", ret_pvst);
             }
             l2ProtoEnabled = L2_NONE;
+            m_mstVlanReplayPending = false;
 
         }
 
@@ -178,31 +181,21 @@ void StpMgr::doStpGlobalTask(Consumer &consumer)
 
         if (replayMstVlanMembers)
         {
-            vector<string> vlanKeys;
             vector<uint16_t> vlan_ids;
 
-            m_stateVlanTable.getKeys(vlanKeys);
-            SWSS_LOG_INFO("Populating VLANs after MST enable, found %zu VLANs", vlanKeys.size());
-
-            for (const auto &vlanKey : vlanKeys)
-            {
-                try
-                {
-                    vlan_ids.push_back(static_cast<uint16_t>(stoi(vlanKey.substr(4))));
-                }
-                catch (const std::exception &e)
-                {
-                    SWSS_LOG_ERROR("Invalid VLAN ID in key '%s': %s", vlanKey.c_str(), e.what());
-                }
-            }
+            collectMstReplayVlanIds(vlan_ids);
+            SWSS_LOG_INFO("Populating VLANs after MST enable, found %zu VLANs", vlan_ids.size());
 
             /* stpd receives STP_BRIDGE_CONFIG first (AF_UNIX DGRAM is ordered).
-             * processStpMstInstVlanPortList() then sends STP_MST_VLAN_PORT_LIST_CONFIG
-             * with MST already enabled so ports are added to the instance.
-             * VLAN members added with STP off are not queued; they are replayed
-             * here from STATE. Live member add after MST is on still uses
-             * doVlanMemUpdateTask(). */
-            processStpMstInstVlanPortList(vlan_ids, true);
+             * Then STP_MST_VLAN_PORT_LIST_CONFIG with MST already enabled.
+             * CONFIG is the full intended set; STATE can be partial, so it is
+             * only used when CONFIG VLAN/VLAN_MEMBER is empty. */
+            int ports_sent = processStpMstInstVlanPortList(vlan_ids, true, true);
+            m_mstVlanReplayPending = (ports_sent == 0);
+            if (m_mstVlanReplayPending)
+            {
+                SWSS_LOG_NOTICE("MST VLAN member replay empty after enable; will retry on next STATE member");
+            }
         }
 
         // Move to the next item
@@ -236,27 +229,8 @@ void StpMgr::doStpVlanTask(Consumer &consumer)
         string key = kfvKey(t);
         string op  = kfvOp(t);
 
-        if (key.size() <= strlen(VLAN_PREFIX) ||
-            key.compare(0, strlen(VLAN_PREFIX), VLAN_PREFIX) != 0)
-        {
-            SWSS_LOG_ERROR("Invalid STP_VLAN key format %s", key.c_str());
-            it = consumer.m_toSync.erase(it);
-            continue;
-        }
-
-        string vlanKey = key.substr(strlen(VLAN_PREFIX));
-        int vlan_id = 0;
-        try
-        {
-            vlan_id = stoi(vlanKey);
-        }
-        catch (const std::exception &e)
-        {
-            SWSS_LOG_ERROR("Invalid vlan ID in STP_VLAN key '%s': %s",
-                           key.c_str(), e.what());
-            it = consumer.m_toSync.erase(it);
-            continue;
-        }
+        string vlanKey = key.substr(4); // Remove Vlan prefix
+        int vlan_id = stoi(vlanKey.c_str());
 
         SWSS_LOG_INFO("STP vlan key %s op %s", key.c_str(), op.c_str());
         if (op == SET_COMMAND)
@@ -268,40 +242,30 @@ void StpMgr::doStpVlanTask(Consumer &consumer)
                 continue;
             }
 
-            try
+            for (auto i : kfvFieldsValues(t))
             {
-                for (auto i : kfvFieldsValues(t))
-                {
-                    SWSS_LOG_DEBUG("Field: %s Val: %s", fvField(i).c_str(), fvValue(i).c_str());
+                SWSS_LOG_DEBUG("Field: %s Val: %s", fvField(i).c_str(), fvValue(i).c_str());
 
-                    if (fvField(i) == "enabled")
-                    {
-                        stpEnable = (fvValue(i) == "true") ? true : false;
-                    }
-                    else if (fvField(i) == "forward_delay")
-                    {
-                        forwardDelay = stoi(fvValue(i).c_str());
-                    }
-                    else if (fvField(i) == "hello_time")
-                    {
-                        helloTime = stoi(fvValue(i).c_str());
-                    }
-                    else if (fvField(i) == "max_age")
-                    {
-                        maxAge = stoi(fvValue(i).c_str());
-                    }
-                    else if (fvField(i) == "priority")
-                    {
-                        priority = stoi(fvValue(i).c_str());
-                    }
+                if (fvField(i) == "enabled")
+                {
+                    stpEnable = (fvValue(i) == "true") ? true : false;
                 }
-            }
-            catch (const std::exception &e)
-            {
-                SWSS_LOG_ERROR("Invalid STP_VLAN field in key '%s': %s",
-                               key.c_str(), e.what());
-                it = consumer.m_toSync.erase(it);
-                continue;
+                else if (fvField(i) == "forward_delay")
+                {
+                    forwardDelay = stoi(fvValue(i).c_str());
+                }
+                else if (fvField(i) == "hello_time")
+                {
+                    helloTime = stoi(fvValue(i).c_str());
+                }
+                else if (fvField(i) == "max_age")
+                {
+                    maxAge = stoi(fvValue(i).c_str());
+                }
+                else if (fvField(i) == "priority")
+                {
+                    priority = stoi(fvValue(i).c_str());
+                }
             }
         }
         else if (op == DEL_COMMAND)
@@ -805,6 +769,13 @@ void StpMgr::doVlanMemUpdateTask(Consumer &consumer)
             tagging_mode = getVlanMemMode(key);
             if (tagging_mode == INVALID_MODE)
             {
+                if (l2ProtoEnabled == L2_MSTP)
+                {
+                    /* CONFIG VLAN_MEMBER may lag STATE on first boot. Retry. */
+                    SWSS_LOG_INFO("invalid mode %s, retry", key.c_str());
+                    it++;
+                    continue;
+                }
                 SWSS_LOG_ERROR("invalid mode %s", key.c_str());
                 it = consumer.m_toSync.erase(it);
                 continue;
@@ -839,6 +810,17 @@ void StpMgr::doVlanMemUpdateTask(Consumer &consumer)
                 sendMsgStpd(STP_MST_VLAN_PORT_LIST_CONFIG, len, (void *)vlan_msg, (L2_PROTO_MODE)vlan_msg->stp_mode);
                 if (vlan_msg)
                     free(vlan_msg);
+
+                if (m_mstVlanReplayPending && op == SET_COMMAND)
+                {
+                    vector<uint16_t> vlan_ids;
+                    collectMstReplayVlanIds(vlan_ids);
+                    int ports_sent = processStpMstInstVlanPortList(vlan_ids, true, true);
+                    if (ports_sent > 0)
+                    {
+                        m_mstVlanReplayPending = false;
+                    }
+                }
             }
         }
         else
@@ -1063,13 +1045,11 @@ void StpMgr::deallocL2Instance(uint32_t vlan_id)
 }
 
 
-int StpMgr::getAllVlanMem(const string &vlanKey, vector<PORT_ATTR>&port_list)
+int StpMgr::collectVlanMembersFromTable(Table &tbl, const string &vlanKey, vector<PORT_ATTR>&port_list)
 {
     PORT_ATTR port_id;
-    vector<FieldValueTuple> vmEntry;
-
     vector<string> vmKeys;
-    m_stateVlanMemberTable.getKeys(vmKeys);
+    tbl.getKeys(vmKeys);
 
     SWSS_LOG_INFO("VLAN Key: %s", vlanKey.c_str());
     for (auto key : vmKeys)
@@ -1091,6 +1071,20 @@ int StpMgr::getAllVlanMem(const string &vlanKey, vector<PORT_ATTR>&port_list)
 
         if (vlanKey == vlanName && !isLagEmpty(intfName))
         {
+            bool exists = false;
+            for (const auto &p : port_list)
+            {
+                if (intfName == p.intf_name)
+                {
+                    exists = true;
+                    break;
+                }
+            }
+            if (exists)
+            {
+                continue;
+            }
+
             port_id.mode = getVlanMemMode(key);
             if (port_id.mode == INVALID_MODE)
             {
@@ -1105,6 +1099,73 @@ int StpMgr::getAllVlanMem(const string &vlanKey, vector<PORT_ATTR>&port_list)
     }
 
     return (int)port_list.size();
+}
+
+int StpMgr::getAllVlanMem(const string &vlanKey, vector<PORT_ATTR>&port_list)
+{
+    return collectVlanMembersFromTable(m_stateVlanMemberTable, vlanKey, port_list);
+}
+
+void StpMgr::collectMstReplayVlanIds(vector<uint16_t> &vlan_ids)
+{
+    unordered_set<uint16_t> ids;
+
+    auto addFromKeys = [&](const vector<string> &keys, bool memberKeys)
+    {
+        for (const auto &key : keys)
+        {
+            string vlanPart = key;
+            if (memberKeys)
+            {
+                size_t found = key.find(CONFIGDB_KEY_SEPARATOR);
+                if (found == string::npos)
+                {
+                    continue;
+                }
+                vlanPart = key.substr(0, found);
+            }
+
+            string idStr = vlanPart;
+            if (idStr.size() > 4 && idStr.compare(0, 4, "Vlan") == 0)
+            {
+                idStr = idStr.substr(4);
+            }
+
+            try
+            {
+                int vid = stoi(idStr);
+                if (vid >= MIN_VLAN_ID && vid <= MAX_VLAN_ID)
+                {
+                    ids.insert(static_cast<uint16_t>(vid));
+                }
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_ERROR("Invalid VLAN ID in key '%s': %s", key.c_str(), e.what());
+            }
+        }
+    };
+
+    vector<string> keys;
+    m_cfgVlanMemberTable.getKeys(keys);
+    addFromKeys(keys, true);
+
+    keys.clear();
+    m_cfgVlanTable.getKeys(keys);
+    addFromKeys(keys, false);
+
+    if (ids.empty())
+    {
+        keys.clear();
+        m_stateVlanMemberTable.getKeys(keys);
+        addFromKeys(keys, true);
+
+        keys.clear();
+        m_stateVlanTable.getKeys(keys);
+        addFromKeys(keys, false);
+    }
+
+    vlan_ids.assign(ids.begin(), ids.end());
 }
 
 
@@ -1169,7 +1230,7 @@ std::vector<uint16_t> StpMgr::getVlanIdsForInstance(uint16_t instance) const
     return vlan_ids;
 }
 
-void StpMgr::processStpMstInstVlanPortList(const vector<uint16_t>& vlan_ids, bool add)
+int StpMgr::processStpMstInstVlanPortList(const vector<uint16_t>& vlan_ids, bool add, bool fallback_config)
 {
     uint16_t vlan_id;
     string vlanKey;
@@ -1178,12 +1239,13 @@ void StpMgr::processStpMstInstVlanPortList(const vector<uint16_t>& vlan_ids, boo
     uint32_t len;
     STP_MST_VLAN_PORT_MAP *pmsg;
     int pi;
+    int ports_sent = 0;
 
     SWSS_LOG_ENTER();
 
     if (l2ProtoEnabled != L2_MSTP)
     {
-        return;
+        return 0;
     }
 
     for (size_t i = 0; i < vlan_ids.size(); i++)
@@ -1191,7 +1253,19 @@ void StpMgr::processStpMstInstVlanPortList(const vector<uint16_t>& vlan_ids, boo
         vlan_id = vlan_ids[i];
         pcount = 0;
         vlanKey = VLAN_PREFIX + to_string(vlan_id);
-        pcount = getAllVlanMem(vlanKey, port_list);
+        if (fallback_config)
+        {
+            /* Enable replay: CONFIG is complete; STATE-only if CONFIG has none. */
+            pcount = collectVlanMembersFromTable(m_cfgVlanMemberTable, vlanKey, port_list);
+            if (!pcount)
+            {
+                pcount = getAllVlanMem(vlanKey, port_list);
+            }
+        }
+        else
+        {
+            pcount = getAllVlanMem(vlanKey, port_list);
+        }
         if (pcount)
         {
             len = sizeof(STP_MST_VLAN_PORT_MAP) + static_cast<uint32_t>(pcount * sizeof(PORT_LIST));
@@ -1199,7 +1273,7 @@ void StpMgr::processStpMstInstVlanPortList(const vector<uint16_t>& vlan_ids, boo
             if (!pmsg)
             {
                 SWSS_LOG_ERROR("Memory allocation failed for STP_MST_VLAN_PORT_MAP, vid %d", vlan_id);
-                return;
+                return ports_sent;
             }
             pmsg->vlan_id = vlan_id;
             pmsg->stp_mode = l2ProtoEnabled;
@@ -1217,8 +1291,11 @@ void StpMgr::processStpMstInstVlanPortList(const vector<uint16_t>& vlan_ids, boo
 
             sendMsgStpd(STP_MST_VLAN_PORT_LIST_CONFIG, len, (void *)pmsg, l2ProtoEnabled);
             free(pmsg);
+            ports_sent += pcount;
         }
     }
+
+    return ports_sent;
 }
 
 void StpMgr::cleanupStpConfigDbOnVlanMemberDelete(uint16_t vlan_id, const std::string &intfName)

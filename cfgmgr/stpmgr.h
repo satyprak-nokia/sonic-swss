@@ -264,6 +264,7 @@ private:
     Table m_cfgStpVlanPortTable;
     Table m_cfgStpPortTable;
     Table m_cfgLagMemberTable;
+    Table m_cfgVlanTable;
     Table m_cfgVlanMemberTable;
     Table m_stateVlanTable;
     Table m_stateVlanMemberTable;
@@ -286,6 +287,7 @@ private:
     bool stpVlanPortTask;
     bool stpPortTask;
     bool stpMstInstTask;
+    bool m_mstVlanReplayPending;
 
     void doTask(Consumer &consumer);
     void doStpGlobalTask(Consumer &consumer);
@@ -303,6 +305,9 @@ private:
     bool isStpPortEmpty();
     bool isStpEnabled(const std::string &intf_name);
     int getAllVlanMem(const std::string &vlanKey, std::vector<PORT_ATTR>& port_list);
+    int collectVlanMembersFromTable(Table &tbl, const std::string &vlanKey,
+                                    std::vector<PORT_ATTR>& port_list);
+    void collectMstReplayVlanIds(std::vector<uint16_t> &vlan_ids);
     int getAllPortVlan(const std::string &intfKey, std::vector<VLAN_ATTR>& vlan_list);
     int8_t getVlanMemMode(const std::string &key);
     int allocL2Instance(uint32_t vlan_id);
@@ -315,7 +320,8 @@ private:
                     std::vector<FieldValueTuple>&tupEntry);
     void processStpMstInstPortAttr(const std::string op, uint16_t mst_id, const std::string intfName,
                                        std::vector<FieldValueTuple>&tupEntry);
-    void processStpMstInstVlanPortList(const std::vector<uint16_t>& vlan_ids, bool add);
+    int processStpMstInstVlanPortList(const std::vector<uint16_t>& vlan_ids, bool add,
+                                     bool fallback_config = false);
     std::vector<uint16_t> parseVlanList(const std::string &vlanStr);
     std::vector<uint16_t> getVlanIdsForInstance(uint16_t instance) const;
     void updateVlanInstanceMap(int instance, const std::vector<uint16_t>&newVlanList, bool operation);
