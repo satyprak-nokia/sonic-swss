@@ -94,6 +94,8 @@ void StpMgr::doTask(Consumer &consumer)
         doStpPortTask(consumer);
     else if (table == CFG_LAG_MEMBER_TABLE_NAME)
         doLagMemUpdateTask(consumer);
+    else if (table == CFG_VLAN_MEMBER_TABLE_NAME)
+        doCfgVlanMemUpdateTask(consumer);
     else if (table == STATE_VLAN_MEMBER_TABLE_NAME)
         doVlanMemUpdateTask(consumer);
     else if (table == "STP_MST")
@@ -203,8 +205,9 @@ void StpMgr::doStpGlobalTask(Consumer &consumer)
                               old_l2ProtoEnabled, l2ProtoEnabled, vlan_ids.size());
 
                 /* CONFIG VLAN_MEMBER is the full set. STATE is used only when
-                 * that VLAN has no CONFIG members. Later adds still arrive
-                 * through doVlanMemUpdateTask(). */
+                 * that VLAN has no CONFIG members. Later adds arrive from
+                 * CONFIG VLAN_MEMBER. STATE VLAN_MEMBER replays the same IPC
+                 * after the port is in the bridge. */
                 processStpMstInstVlanPortList(vlan_ids, true);
             }
         }
@@ -793,6 +796,15 @@ void StpMgr::processStpPortAttr(const string op,
         msg->enabled = 0;
     }
 
+    /*
+     * MSTP attaches a port only when stpd already has its VLAN membership.
+     * Send CONFIG VLAN_MEMBER before STP_PORT so that membership is in place
+     * when this message is processed. A VLAN_MEMBER write that lands after
+     * this STP_PORT row is handled by doCfgVlanMemUpdateTask().
+     */
+    if (op == SET_COMMAND && l2ProtoEnabled == L2_MSTP && msg->enabled)
+        sendMstVlanMembershipForPort(intfName);
+
     // Send the fully prepared message to the STP daemon.
     sendMsgStpd(STP_PORT_CONFIG, len, reinterpret_cast<void *>(msg), l2ProtoEnabled);
 
@@ -845,6 +857,150 @@ void StpMgr::doStpPortTask(Consumer &consumer)
         SWSS_LOG_INFO("STP port key:%s op:%s", key.c_str(), op.c_str());
         processStpPortAttr(op, kfvFieldsValues(t), key);
 
+        it = consumer.m_toSync.erase(it);
+    }
+}
+
+static int8_t taggingModeFromFields(const vector<FieldValueTuple> &fvs)
+{
+    for (const auto &fvt : fvs)
+    {
+        if (fvField(fvt) == "tagging_mode")
+            return (fvValue(fvt) == "untagged") ? UNTAGGED_MODE : TAGGED_MODE;
+    }
+    return INVALID_MODE;
+}
+
+void StpMgr::sendMstVlanPortList(uint16_t vlan_id, const string &intfName,
+                                 int8_t tagging_mode, bool add)
+{
+    STP_MST_VLAN_PORT_MAP *vlan_msg = nullptr;
+    uint32_t len;
+
+    if (l2ProtoEnabled != L2_MSTP || isLagEmpty(intfName))
+        return;
+
+    len = (uint32_t)(sizeof(STP_MST_VLAN_PORT_MAP) + sizeof(PORT_LIST));
+    vlan_msg = (STP_MST_VLAN_PORT_MAP *)calloc(1, len);
+    if (!vlan_msg)
+    {
+        SWSS_LOG_ERROR("calloc failed for vlan %u port %s", vlan_id, intfName.c_str());
+        return;
+    }
+
+    strncpy(vlan_msg->port_list[0].intf_name, intfName.c_str(), IFNAMSIZ - 1);
+    vlan_msg->port_list[0].tagging_mode = tagging_mode;
+    vlan_msg->port_count = 1;
+    vlan_msg->vlan_id = vlan_id;
+    vlan_msg->stp_mode = l2ProtoEnabled;
+    vlan_msg->add = add ? 1 : 0;
+
+    sendMsgStpd(STP_MST_VLAN_PORT_LIST_CONFIG, len, (void *)vlan_msg, L2_MSTP);
+    free(vlan_msg);
+}
+
+void StpMgr::sendMstVlanMembershipForPort(const string &intfName)
+{
+    vector<string> vmKeys;
+
+    if (l2ProtoEnabled != L2_MSTP || isLagEmpty(intfName))
+        return;
+
+    m_cfgVlanMemberTable.getKeys(vmKeys);
+    for (const auto &key : vmKeys)
+    {
+        size_t found = key.find(CONFIGDB_KEY_SEPARATOR);
+        int vlan_id;
+        int8_t tagging_mode;
+        string vlanPart;
+        string memberName;
+
+        if (found == string::npos)
+            continue;
+
+        vlanPart = key.substr(0, found);
+        memberName = key.substr(found + 1);
+        if (memberName != intfName)
+            continue;
+
+        if (vlanPart.size() > 4 && vlanPart.compare(0, 4, "Vlan") == 0)
+            vlanPart = vlanPart.substr(4);
+
+        if (!parseInteger(vlanPart, vlan_id, "VLAN member key"))
+            continue;
+
+        tagging_mode = getVlanMemMode(key);
+        if (tagging_mode == INVALID_MODE)
+        {
+            SWSS_LOG_ERROR("invalid mode %s", key.c_str());
+            continue;
+        }
+
+        sendMstVlanPortList(static_cast<uint16_t>(vlan_id), intfName, tagging_mode, true);
+    }
+}
+
+void StpMgr::doCfgVlanMemUpdateTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+        string key = kfvKey(t);
+        string op = kfvOp(t);
+        string vlanKey;
+        size_t found;
+        int vlan_id;
+        string intfName;
+        int8_t tagging_mode = TAGGED_MODE;
+
+        /*
+         * PVST still uses STATE_DB VLAN_MEMBER. Members that exist before
+         * MSTP is enabled are replayed by processStpMstInstVlanPortList().
+         */
+        if (l2ProtoEnabled != L2_MSTP)
+        {
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+
+        vlanKey = key;
+        if (vlanKey.size() > 4 && vlanKey.compare(0, 4, "Vlan") == 0)
+            vlanKey = vlanKey.substr(4);
+        found = vlanKey.find(CONFIGDB_KEY_SEPARATOR);
+        if (found == string::npos)
+        {
+            SWSS_LOG_ERROR("Invalid key format. No member port is presented: %s", key.c_str());
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+
+        if (!parseInteger(vlanKey.substr(0, found), vlan_id, "VLAN member key"))
+        {
+            SWSS_LOG_ERROR("Invalid VLAN member key %s, ignoring", key.c_str());
+            it = consumer.m_toSync.erase(it);
+            continue;
+        }
+        intfName = vlanKey.substr(found + 1);
+
+        if (op == SET_COMMAND)
+        {
+            tagging_mode = taggingModeFromFields(kfvFieldsValues(t));
+            if (tagging_mode == INVALID_MODE)
+                tagging_mode = getVlanMemMode(key);
+            if (tagging_mode == INVALID_MODE)
+            {
+                SWSS_LOG_INFO("invalid mode %s, retry", key.c_str());
+                it++;
+                continue;
+            }
+        }
+
+        SWSS_LOG_INFO("CONFIG VLAN member %s op %s mode %d", key.c_str(), op.c_str(), tagging_mode);
+        sendMstVlanPortList(static_cast<uint16_t>(vlan_id), intfName, tagging_mode,
+                            op == SET_COMMAND);
         it = consumer.m_toSync.erase(it);
     }
 }
@@ -907,31 +1063,10 @@ void StpMgr::doVlanMemUpdateTask(Consumer &consumer)
 
         if (l2ProtoEnabled == L2_MSTP)
         {
-            STP_MST_VLAN_PORT_MAP *vlan_msg = nullptr;
-            int len;
-
-            if (!isLagEmpty(intfName))
-            {
-                len = (uint32_t)(sizeof(STP_MST_VLAN_PORT_MAP) + (1 * sizeof(PORT_LIST)));
-
-                vlan_msg = (STP_MST_VLAN_PORT_MAP*)calloc(1, len);
-                if (!vlan_msg)
-                {
-                    SWSS_LOG_ERROR("calloc failed for vlan %d", vlan_id);
-                    return;
-                }
-
-                strncpy(vlan_msg->port_list[0].intf_name, intfName.c_str(), IFNAMSIZ-1);
-                vlan_msg->port_list[0].tagging_mode = tagging_mode;
-                vlan_msg->port_count = 1;
-                vlan_msg->vlan_id = (uint16_t)vlan_id;
-                vlan_msg->stp_mode = l2ProtoEnabled;
-                vlan_msg->add = (op == SET_COMMAND) ? true : false;
-
-                sendMsgStpd(STP_MST_VLAN_PORT_LIST_CONFIG, len, (void *)vlan_msg,
-                            (L2_PROTO_MODE)vlan_msg->stp_mode);
-                free(vlan_msg);
-            }
+            /* Replay after the bridge port exists. Membership itself is sent
+             * from CONFIG VLAN_MEMBER. */
+            sendMstVlanPortList(static_cast<uint16_t>(vlan_id), intfName, tagging_mode,
+                                op == SET_COMMAND);
         }
         else
         {

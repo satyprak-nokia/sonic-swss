@@ -294,6 +294,7 @@ private:
     void doStpVlanPortTask(Consumer &consumer);
     void doStpPortTask(Consumer &consumer);
     void doVlanMemUpdateTask(Consumer &consumer);
+    void doCfgVlanMemUpdateTask(Consumer &consumer);
     void doLagMemUpdateTask(Consumer &consumer);
     void doStpMstGlobalTask(Consumer &consumer);
     void doStpMstInstTask(Consumer &consumer);
@@ -320,6 +321,9 @@ private:
     void processStpMstInstPortAttr(const std::string op, uint16_t mst_id, const std::string intfName,
                                        std::vector<FieldValueTuple>&tupEntry);
     void processStpMstInstVlanPortList(const std::vector<uint16_t>& vlan_ids, bool add);
+    void sendMstVlanPortList(uint16_t vlan_id, const std::string &intfName,
+                             int8_t tagging_mode, bool add);
+    void sendMstVlanMembershipForPort(const std::string &intfName);
     bool parseVlanList(const std::string &vlanStr, std::vector<uint16_t> &vlanList);
     void updateVlanInstanceMap(int instance, const std::vector<uint16_t>&newVlanList, bool operation);
     bool isInstanceMapped(uint16_t instance);
